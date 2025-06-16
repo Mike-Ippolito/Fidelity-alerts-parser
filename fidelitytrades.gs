@@ -1,100 +1,112 @@
-<!DOCTYPE html>
-<html>
-  <head>
-    <base target="_top">
-    <style>
-      body { font-family: Arial, sans-serif; padding: 20px; }
-      #date-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-      label { display: block; margin-bottom: 5px; font-weight: bold; }
-      input[type="date"] { padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 130px; }
-      button { background-color: #4285F4; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; width: 100%; }
-      button:disabled { background-color: #ccc; cursor: not-allowed; }
-      #status { margin-top: 15px; text-align: center; font-style: italic; color: #555; }
-      #results-container a { display: block; text-align: center; margin-top: 10px; padding: 10px; color: white; text-decoration: none; border-radius: 4px; font-weight: bold; }
-      .csv-link { background-color: #34A853; } /* Green */
-      .archive-link { background-color: #FBBC05; } /* Yellow */
-    </style>
-  </head>
-  <body>
-    <div id="date-container">
-      <div>
-        <label for="start-date">Start Date</label>
-        <input type="date" id="start-date">
-      </div>
-      <div>
-        <label for="end-date">End Date</label>
-        <input type="date" id="end-date">
-      </div>
-    </div>
-    
-    <button id="process-button" onclick="processAll()">Process & Download</button>
-    <div id="status"></div>
-    <div id="results-container"></div>
+/**
+ * Creates a custom menu in the spreadsheet to run the script.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Fidelity Parser')
+    .addItem('Process & Download Trades...', 'showDatePickerDialog')
+    .addToUi();
+}
 
-    <script>
-      document.getElementById('end-date').valueAsDate = new Date();
-      let sevenDaysAgo = new Date();
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-      document.getElementById('start-date').valueAsDate = sevenDaysAgo;
+/**
+ * Displays an HTML dialog with date input fields.
+ */
+function showDatePickerDialog() {
+  const html = HtmlService.createHtmlOutputFromFile('DatePicker')
+    .setWidth(400)
+    .setHeight(250);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Process Trades by Date');
+}
 
-      function processAll() {
-        const startDate = document.getElementById('start-date').value;
-        const endDate = document.getElementById('end-date').value;
-        const button = document.getElementById('process-button');
-        const statusDiv = document.getElementById('status');
+/**
+ * The main processing function. It now appends to the active sheet,
+ * creates a new archive sheet, and generates a CSV for download.
+ */
+function processTrades(startDate, endDate) {
+  Logger.log(`--- Starting Full Process from ${startDate} to ${endDate} ---`);
+  
+  const startParts = startDate.split('-').map(Number);
+  const endParts = endDate.split('-').map(Number);
+  
+  const afterDate = new Date(startParts[0], startParts[1] - 1, startParts[2]);
+  const beforeDate = new Date(endParts[0], endParts[1] - 1, endParts[2]);
+  beforeDate.setDate(beforeDate.getDate() + 1);
 
-        if (!startDate || !endDate) {
-          statusDiv.textContent = "Please select both a start and end date.";
-          return;
+  const afterQuery = Utilities.formatDate(afterDate, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+  const beforeQuery = Utilities.formatDate(beforeDate, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+
+  const searchQuery = `label:"Fidelity Trades" after:${afterQuery} before:${beforeQuery}`;
+  const threads = GmailApp.search(searchQuery);
+  Logger.log(`Found ${threads.length} email threads.`);
+  
+  const dataToWrite = [];
+
+  threads.forEach(thread => {
+    thread.getMessages().forEach(message => {
+      const htmlBody = message.getBody();
+      if (!htmlBody) return;
+
+      const tradeSectionMatch = htmlBody.match(/Your order to.*?Order Number:.*?<\/td>/is);
+      if (!tradeSectionMatch) return;
+
+      let tradeText = tradeSectionMatch[0].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const messageDate = Utilities.formatDate(message.getDate(), Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ssXXX");
+      
+      let tradeData = null;
+
+      const stockRegex = /Your order to (BUY|SELL): ([\d,.]+) shares of ([A-Z]+) was.*?Filled: ([\d,.]+) shares @ \$([\d,.]+)/i;
+      const stockMatch = tradeText.match(stockRegex);
+
+      if (stockMatch) {
+        tradeData = { transactionType: stockMatch[1], ticker: stockMatch[3], quantity: stockMatch[4], price: stockMatch[5] };
+      } else {
+        const optionsRegex = /Your order to (BUY|SELL) (PUT|CALL): ([\d,.]+) of -([A-Z0-9]+) was.*?Filled: ([\d,.]+) @ \$([\d,.]+)/i;
+        const optionsMatch = tradeText.match(optionsRegex);
+        if (optionsMatch) {
+          tradeData = { transactionType: `${optionsMatch[1]} ${optionsMatch[2]}`, ticker: optionsMatch[4], quantity: optionsMatch[5], price: optionsMatch[6] };
         }
-
-        button.disabled = true;
-        button.textContent = 'Processing...';
-        statusDiv.textContent = 'This may take a minute...';
-
-        google.script.run
-          .withSuccessHandler(onSuccess)
-          .withFailureHandler(onFailure)
-          .processTrades(startDate, endDate);
       }
 
-      function onSuccess(result) {
-        const statusDiv = document.getElementById('status');
-        const resultsContainer = document.getElementById('results-container');
-        document.getElementById('process-button').style.display = 'none';
-
-        if (result.status === 'NO_TRADES_FOUND') {
-          statusDiv.textContent = 'No trades were found in the selected date range.';
-          return;
-        }
-
-        statusDiv.textContent = `Success! Appended ${result.tradeCount} trades to your sheet.`;
-
-        // Create CSV Download Link
-        const blob = new Blob([result.csvData], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const csvLink = document.createElement("a");
-        const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, "-");
-        csvLink.setAttribute("href", url);
-        csvLink.setAttribute("download", `Fidelity_Report_${timestamp}.csv`);
-        csvLink.textContent = "Download CSV Report";
-        csvLink.classList.add('csv-link');
-        resultsContainer.appendChild(csvLink);
-        
-        // Create Archive Link
-        const archiveLink = document.createElement("a");
-        archiveLink.setAttribute("href", result.archiveUrl);
-        archiveLink.setAttribute("target", "_blank"); // Open in new tab
-        archiveLink.textContent = "Open Archive Sheet";
-        archiveLink.classList.add('archive-link');
-        resultsContainer.appendChild(archiveLink);
+      if (tradeData) {
+        const orderNumberMatch = tradeText.match(/Order Number: (\S+)/i);
+        dataToWrite.push([
+          messageDate,
+          tradeData.transactionType.toUpperCase(),
+          tradeData.ticker,
+          tradeData.quantity.replace(/,/g, ''),
+          tradeData.price.replace(/,/g, ''),
+          orderNumberMatch ? orderNumberMatch[1] : 'N/A'
+        ]);
       }
+    });
+  });
 
-      function onFailure(error) {
-        document.getElementById('status').textContent = 'Error: ' + error.message;
-        document.getElementById('process-button').disabled = false;
-        document.getElementById('process-button').textContent = 'Process & Download';
-      }
-    </script>
-  </body>
-</html>
+  if (dataToWrite.length > 0) {
+    // Action 1: Append to the CURRENT active sheet
+    const activeSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    activeSheet.getRange(activeSheet.getLastRow() + 1, 1, dataToWrite.length, 6).setValues(dataToWrite);
+
+    // Action 2: Create a NEW Google Sheet for archive
+    const ss = SpreadsheetApp.create('Fidelity Trade Archive ' + new Date().toLocaleString());
+    const archiveSheet = ss.getActiveSheet();
+    archiveSheet.appendRow(['Date', 'Transaction Type', 'Ticker', 'Shares', 'Price', 'Order Number']);
+    archiveSheet.getRange(2, 1, dataToWrite.length, 6).setValues(dataToWrite);
+
+    // Action 3: Generate CSV data for download
+    const header = ['Date', 'Transaction Type', 'Ticker', 'Shares', 'Price', 'Order Number'];
+    let csvContent = header.join(',') + '\n';
+    dataToWrite.forEach(row => {
+      csvContent += row.map(value => `"${value}"`).join(',') + '\n';
+    });
+
+    Logger.log(`Processed ${dataToWrite.length} trades.`);
+    return { 
+      status: 'SUCCESS',
+      csvData: csvContent, 
+      archiveUrl: ss.getUrl(),
+      tradeCount: dataToWrite.length
+    };
+  } else {
+    return { status: 'NO_TRADES_FOUND' };
+  }
+}
